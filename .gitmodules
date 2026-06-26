@@ -1,0 +1,8 @@
+[submodule "openpi"]
+	path = openpi
+	url = https://github.com/Physical-Intelligence/openpi.git
+	branch = main
+[submodule "lehome-challenge"]
+	path = lehome-challenge
+	url = https://github.com/IliaLarchenko/lehome-challenge.git
+	branch = main

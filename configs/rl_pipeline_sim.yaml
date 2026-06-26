@@ -1,0 +1,223 @@
+# RL Pipeline Configuration — SIMULATION ROUND (training + rollouts).
+#
+# This is the config the sim-phase RL loop ran with (sim_rl: fresh start from
+# original Pi0.5 weights, golden success datasets as a second BC source, all
+# prior-round rollouts as init datasets). Sim-native output schema: 30 fps, USD
+# radians, sim camera framing, no environment augmentation.
+#
+# For the real-round heavily-augmented sim-correction collection config see
+# configs/rl_pipeline_sim_to_real.yaml.
+#
+# Override any value via CLI: --warmup_steps 5000, --num_iterations 20, etc.
+
+# Base training config name (from config.py)
+config_name: pi_modified_bc_rl
+exp_name: sim_rl
+project_name: LeHome
+
+# Warm-up phase (first training iteration when starting fresh)
+warmup_steps: 10000
+
+# RL cycle
+num_iterations: 300
+steps_per_iteration: 1000
+
+# Rollout collection
+num_workers: 4
+camera_width: 640
+camera_height: 480
+dataset_width: 320
+dataset_height: 240
+# Sim-native dataset schema: EvalDatasetWriter — 30 fps, single shape,
+# radians, all aux fields (rewards, values, check_distances, ...).
+dataset_format: sim
+dataset_units: radians
+max_retries: 1
+save_debug_video: true  # 3-cam grid + overlay video per episode (320x240, human inspection only)
+
+# Model overrides
+use_advantage_embedding: true  # Enable advantage embedding conditioning in model
+freeze_vision_backbone: true   # Keep SigLIP vision encoder frozen
+use_flash_attention: true  # flash attention (~6% speedup over vanilla)
+use_xsa: true              # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
+
+# Auxiliary loss weights (main flow-matching `action` loss is always 1.0).
+# Any field omitted / set to null inherits the model's dataclass default.
+aux_losses:
+  fast: 0.01          # FAST auxiliary action-token loss
+  success: 0.05       # BCE on P(success)
+  checkpoint: 0.001   # BCE on P(reward >= 0.5)
+  ttc: 0.05           # MSE on time-to-completion
+  completion: 0.02    # MSE on completion fraction (success-only)
+  garment_type: 0.02  # CE on 4-class garment type
+  # Keypoint-distance head (Head 1): MSE on per-condition normalized distances.
+  keypoint_distance: 0.02
+  # WM-FAST head (Head 2, training-only). Future success / completion /
+  # keypoint distances at t + 30 steps, predicted from a query token placed
+  # after the FAST block in the prefix.
+  wm_fast_success: 0.01
+  wm_fast_completion: 0.01
+  wm_fast_keypoint: 0.01
+  # WM-flow head (Head 3). Same targets, predicted from a query at the tail
+  # of the action-expert suffix. Per-sample loss weighted by (1 - t) so
+  # nearly-clean-action steps dominate.
+  wm_flow_success: 0.1
+  wm_flow_completion: 0.05
+  wm_flow_keypoint: 0.02
+
+# Augmentation config — the sim round ran with environment augmentation OFF
+# (the evaluation environment is the training environment, so there is no
+# domain gap to bridge). All knobs zeroed; per-step tint disabled.
+augmentation:
+  # Episode-level
+  pattern_swap_p: 0.4        # probability of texture pattern swap from pool
+  color_remap_p: 0.4         # probability of LAB-space color remap
+  pos_offset_range: 0.02      # meters, uniform(−v, +v) per xyz added to reset range
+  rot_offset_range: 2.0      # degrees, uniform(−v, +v) per euler angle
+  scale_range: 0.1           # e.g. 0.1 → scale ∈ [0.9, 1.1]; success thresholds auto-adjusted
+  roughness_range: 0.1       # delta from default roughness, clamped [0,1]
+  camera_pos_jitter: 0.0     # meters, wrist cameras position jitter
+  camera_rot_jitter: 0.0     # degrees, wrist cameras rotation jitter
+  top_camera_pos_jitter: 0.0 # meters, top camera position jitter
+  top_camera_rot_jitter: 0.0 # degrees, top camera rotation jitter
+  # Per-step
+  step_color_tint: true     # per-step scale+bias color randomization
+  light_intensity_range: 200   # delta from default 1200
+  light_color_range: 0.2     # delta per channel from default 0.75
+
+# augmentation can be optionally overridden  each rollout strategy via nested `augmentation:` block.
+
+# Rollout strategies (optional — omit for pure random)
+# Each strategy can override augmentation via nested `augmentation:` block.
+rollout_strategies:
+  - name: full
+    num_garments: 40
+    num_episodes: 1
+  # - name: curriculum
+  #   num_garments: 40
+  #   num_episodes: 3
+  #   target_sr: 0.1
+  # - name: success_replay
+  #   num_states: 40
+  #   replays_per_state: 2
+
+# BC dataset (sim teleop demonstrations)
+bc_dataset:
+  root: data/lehome_challenge_merged/four_types_merged
+  repo_id: lehome_bc
+  initial_sampling_share: 1.0
+  decay_factor: 1.0
+  min_sampling_share: 0.9
+  bc_advantage: 0.3  # fixed advantage for BC samples (uniform sampling)
+  use_for_success_labels: false  # don't force success=1 on BC — mask BC out of success/checkpoint/ttc losses
+
+# Dagger episodes: treated like BC with fixed advantage, uniform sampling.
+# Per-dataset sampling_share decays each iteration, clamped to min_sampling_share.
+dagger_dataset:
+  decay_factor: 1.0
+  min_sampling_share: 0.1
+  dagger_advantage: 0.3
+
+# Second BC-style dataset: golden successful rollouts selected from a prior pipeline run
+# (treated as BC via the initial_dagger_datasets slot — fixed advantage, uniform sampling).
+# initial_dagger_datasets:
+#   - root: 'local_path'
+#     sampling_share: 1.0
+#     repo_id: 'repo_id'
+
+
+# Initial RL datasets: useful if you restarting training and already have some rollouts collected
+# initial_rl_datasets:
+#   - root: 'local_path'
+#     sampling_share: 1.0
+#     segment_only: true # segment_only=true if values are from a different checkpoint and value predictions are stale
+
+# RL dataset decay
+rl_decay_factor: 0.98
+rl_min_sampling_share: 0.1
+
+# Advantage computation
+# mode: auto = segment for iter 0, gae for iter 1+. Can also force "segment" or "gae"
+advantage:
+  mode: auto
+  gae_lambda: 0.99
+  gamma: 0.999
+  weighting_clipping: [-2.0, 2.0]  # (min, max) for exp(clip(advantage, min, max)); (0,0) = uniform
+  beta: 1.0  # AWR temperature: global_std *= beta before normalizing. Higher = more uniform sampling
+  segment_only_threshold: 0.1  # Datasets with sampling_share < 0.1 auto-switch to segment-only advantages
+  success_alpha: 0.5     # Dampens the P_success transition term in GAE_success delta; 0 removes value from GAE
+  completion_alpha: 0.5  # Weight on GAE_completion (reward-free GAE over completion head); 0 disables
+  value_tail_k: 30       # Linearly interp EMA(P_success) over last K frames to true success label; 0 disables
+
+# Per-garment precision boost.  After advantage computation, rank successful
+# episodes PER GARMENT by the binding-condition margin on the final
+# check_distances and add `boost` to every frame's advantage for the top
+# `top_k` fraction.  Set boost=0 to disable.
+precision_boost:
+  boost: 0.3
+  top_k: 0.20
+  min_successes: 5
+
+# Wandb
+wandb_enabled: true
+
+# Training overrides
+batch_size: 192
+save_interval: 500
+keep_period: 5000
+
+# Training-time image + state augmentations applied inside compute_detailed_loss.
+# The sim round ran with the dataclass defaults (shared-camera color jitter +
+# Gaussian blur + top-cam crop/rotate) and NO state noise. The heavy
+# sim-to-real photometric stack lives in rl_pipeline_sim_to_real.yaml.
+train_augmentation:
+  state_noise_std: 0.02
+
+# HF sync daemon (background uploads/downloads)
+hf_sync_enabled: true
+
+# HuggingFace Hub message bus — set to your own repos (trainer pushes
+# checkpoints to hf_model_repo, pulls rollout datasets from hf_dataset_repo).
+hf_model_repo: <your-hf-username>/<model-repo>
+hf_dataset_repo: <your-hf-username>/<dataset-repo>
+
+# Inference hyperparameter optimization (Thompson Sampling).
+# Per-garment fixed configs take precedence over Thompson Sampling whether
+# `enabled` is true or false; missing fields fall back to
+# inference_optimization.DEFAULT_CONFIG. These are the tuned sim-round values.
+inference_optimization:
+  enabled: true
+  decay_factor: 0.90     # Shrink posteriors toward uniform each iteration
+  per_garment_type_config:
+    top_long:
+      actions_to_execute: 5
+      k_execute: 1.0
+      actions_to_keep: 6
+      time_threshold_inpaint: 0.4
+      cfg_scale: 7
+      noise_temperature: 0.9
+      num_rollout_candidates: 2
+    top_short:
+      actions_to_execute: 5
+      k_execute: 1.0
+      actions_to_keep: 3
+      time_threshold_inpaint: 0.4
+      cfg_scale: 7
+      noise_temperature: 0.7
+      num_rollout_candidates: 3
+    pant_long:
+      actions_to_execute: 3
+      k_execute: 1.0
+      actions_to_keep: 3
+      time_threshold_inpaint: 0.5
+      cfg_scale: 9
+      noise_temperature: 0.7
+      num_rollout_candidates: 3
+    pant_short:
+      actions_to_execute: 3
+      k_execute: 1.0
+      actions_to_keep: 3
+      time_threshold_inpaint: 0.5
+      cfg_scale: 7
+      noise_temperature: 0.7
+      num_rollout_candidates: 3

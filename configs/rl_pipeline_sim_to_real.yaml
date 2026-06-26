@@ -1,0 +1,107 @@
+# RL Pipeline Configuration — REAL ROUND sim-data correction (collection only).
+#
+# Heavily-augmented sim success-replay collection: replays saved success
+# states against a pinned checkpoint and writes datasets in the real BC
+# schema (20 fps, degree units, real-aligned top camera at 1280x720, orange
+# arms, heavy visual randomization). Used as a `--rollout_worker` only — no
+# training data lives here; real-round training runs through the
+# `pi_modified_real_bc` training config, which consumes the collected
+# rollouts as a `home_sim` bucket source.
+#
+# For the sim-round training/rollout config see configs/rl_pipeline_sim.yaml.
+
+# Base training config name (from config.py)
+config_name: pi_modified_bc_rl
+exp_name: sim_rl
+project_name: LeHome
+
+# Rollout collection
+num_workers: 5
+camera_width: 640
+camera_height: 480
+# Top camera renders at 1280x720 (real BC right_front resolution) when set.
+# Wrists stay at camera_width/camera_height. Used only when dataset_format=real_bc.
+top_camera_width: 1280
+top_camera_height: 720
+
+dataset_width: 640
+dataset_height: 360
+# Output dataset schema. "real_bc" = RealFormatDatasetWriter mirroring
+# data/lehome_real/four_types_merged: 20 fps, per-cam shapes (top 720x1280
+# real-canonical, wrist 480x640), garment via task_index, no aux fields.
+# 30 Hz sim → 20 Hz with 2× wall-clock stretch.
+dataset_format: real_bc
+# State/action units for dataset_format=real_bc: "degrees" converts to the
+# real-robot degree-mode convention (arm joints in degrees, gripper 0-100) so
+# the dataset can be mixed with real recordings. Motor-pct is not supported
+# anywhere.
+dataset_units: degrees
+max_retries: 1
+# Best-of-N rollout sampling. N=1 disables (default).
+num_rollout_candidates: 1
+save_debug_video: true  # 3-cam grid + overlay video per episode (human inspection only)
+
+# Model overrides
+use_advantage_embedding: true  # Enable advantage embedding conditioning in model
+freeze_vision_backbone: true   # Keep SigLIP vision encoder frozen
+use_flash_attention: true  # XLA flash attention (~6% speedup over vanilla)
+use_xsa: true              # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
+
+# Augmentation config — HEAVY sim-to-real randomization (all values are
+# deltas from defaults — 0 = no change).
+# Episode-level: applied once after env.reset()
+# Per-step: applied every render step
+augmentation:
+  # Episode-level
+  pattern_swap_p: 0.8        # probability of texture pattern swap from pool
+  color_remap_p: 0.8          # probability of LAB-space color remap
+  pos_offset_range: 0.05       # meters, uniform(−v, +v) per xyz added to reset range
+  rot_offset_range: 3.00     # degrees, uniform(−v, +v) per euler angle
+  # Physics-affecting augs disabled (success replay restores the saved physics
+  # state — scaling / roughness changes would break the recorded dynamics).
+  scale_range: 0.0
+  roughness_range: 0.0
+  # Wrist cam jitter: very tight (0.5 cm / 0.5°) because wrist cams are close
+  # to the action and open-loop replays can't compensate.
+  camera_pos_jitter: 0.005    # meters, wrist cameras position jitter
+  camera_rot_jitter: 0.5      # degrees, wrist cameras rotation jitter
+  # Top cam jitter: 1.5 cm / 1.5° (calibrated against real overlay).
+  top_camera_pos_jitter: 0.015  # meters, top camera position jitter
+  top_camera_rot_jitter: 1.5    # degrees, top camera rotation jitter
+  # Constant (non-random) offset added to the top camera pose on top of any
+  # jitter. All zeros = use upstream offset from garment_bi_cfg_v2.py unchanged.
+  top_camera_pos_offset:    [-0.016, 0.27, 0.12]   # X_local slight left; +Y toward robots; +Z up
+  top_camera_rot_offset_deg: [-24.0, 0.0, 0.0]     # ~+5° look tilt away from vertical
+  top_camera_focal_scale:   0.79                    # widens HFOV from sim's native ~67° → real's 80°
+  arm_xy_shift: 0.005          # meters, per-arm independent XY base shift (physics-affecting; saved for replay)
+  arm_rot_z_deg: 2.00          # degrees, per-arm independent Z-axis base rotation
+  table_uv_shift: 0.25         # UV units, ±v per s/t on table cover (visual only, no physics)
+  table_uv_rot_deg: 30.0       # degrees, UV-space rotation on table cover
+  camera_focal_jitter: 0.05    # fractional, ±5% focal length per camera
+  light_dome_rot_deg: 15.0     # degrees, dome light Euler jitter
+  # # Per-step
+  step_color_tint: true        # per-step scale+bias color randomization
+  light_intensity_range: 200   # delta from default 1200, e.g. 400 → [800, 1600]
+  light_color_range: 0.2       # delta per channel from default 0.75
+  arm_color_range: 1.0         # >0 enables per-step yellow→orange arm color (single shared draw)
+  light_color_temp_range: 1000.0  # Kelvin half-width around 6500K
+
+# Rollout strategies — success replay ONLY. Physics state is restored from
+# saved success snapshots and replayed open-loop under fresh visual
+# augmentation; only successful replays are kept.
+rollout_strategies:
+  - name: success_replay
+    num_states: 80
+    replays_per_state: 2
+    uniform_garment_sampling: true
+
+# Wandb
+wandb_enabled: true
+
+# HF sync daemon (background uploads/downloads) — required by --rollout_worker
+hf_sync_enabled: true
+
+# HuggingFace Hub message bus — set to your own repos (trainer pushes
+# checkpoints to hf_model_repo, pulls rollout datasets from hf_dataset_repo).
+hf_model_repo: <your-hf-username>/<model-repo>
+hf_dataset_repo: <your-hf-username>/<dataset-repo>

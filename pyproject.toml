@@ -1,0 +1,75 @@
+[project]
+name = "lehome-solution"
+version = "0.1.0"
+description = "LeHome Challenge baseline solution based on Pi0.5/OpenPI"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    "openpi",
+    "jax[cuda12]==0.5.3",
+    "flax==0.10.2",
+    "numpy>=1.22.4,<2.0.0",
+    "torch==2.7.1",
+    "torchcodec==0.5",
+    "tyro>=0.9.12",
+    "pydantic>=2.10.3",
+    "opencv-python>=4.10.0",
+    "joblib>=1.4.2",
+    "matplotlib>=3.10.0",
+    "scipy>=1.14.1",
+    "pandas>=2.2.3",
+    "pyarrow>=18.1.0",
+    "numpydantic>=1.7.0",
+    "einops>=0.8.0",
+    "etils>=1.10.0",
+    "websockets>=14.1",
+    "orbax-checkpoint==0.11.13",
+    "tqdm-loggable>=0.2",
+    "lerobot>=0.4.3",
+    "wandb>=0.18.0",
+    "gpustat>=1.1.1",
+    "huggingface-hub[cli]>=0.20.0",
+    "chex>=0.1.88",
+    "pytest>=8.0",
+    "pyrealsense2>=2.57.7.10387",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.29.5",
+    "jupyter>=1.1.1",
+    "pre-commit>=4.0.1",
+]
+
+[tool.uv]
+override-dependencies = ["lerobot>=0.4.3", "rerun-sdk>=0.22,<0.24"]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+openpi = { path = "openpi", editable = true }
+torch = { index = "pytorch-cu126" }
+torchcodec = { index = "pytorch-cu126" }
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lehome_solution*"]
+
+[tool.setuptools.package-data]
+lehome_solution = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow",
+    "gpu: marks tests that require GPU",
+]

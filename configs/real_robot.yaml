@@ -1,0 +1,44 @@
+# Real-robot hardware mapping for live rollouts / probes.
+#
+# Ports/serials below are PLACEHOLDERS — replace with your own before running
+# (see README). Arms: ls /dev/serial/by-id/   Wrist cams: ls /dev/v4l/by-path/
+#
+# `port` is the follower arm; `leader_port` is the matching teleop leader
+# (only used by scripts/record_real_dagger.py).
+arms:
+  left:
+    port:        /dev/serial/by-id/<your-left-follower>
+    leader_port: /dev/serial/by-id/<your-left-leader>
+  right:
+    port:        /dev/serial/by-id/<your-right-follower>
+    leader_port: /dev/serial/by-id/<your-right-leader>
+
+
+cameras:
+  # Overhead camera — sim convention name: observation.images.top_rgb.
+  # My setup used RealSense D435 (RGB color stream) - so I needed a bit of extra code to handle it properly.
+  top:
+    backend: pyrealsense2
+    # Required by lerobot's RealSenseCameraConfig (serial_number_or_name).
+    serial: "<your-realsense-serial>"
+    width: 1280
+    height: 720
+    fps: 30
+
+  # Left-arm wrist camera — sim convention name: observation.images.left_rgb.
+  left_wrist:
+    backend: v4l2
+    device: /dev/v4l/by-path/<your-left-wrist>
+    width: 640
+    height: 480
+    fourcc: MJPG
+    fps: 30
+
+  # Right-arm wrist camera — sim convention name: observation.images.right_rgb.
+  right_wrist:
+    backend: v4l2
+    device: /dev/v4l/by-path/<your-right-wrist>
+    width: 640
+    height: 480
+    fourcc: MJPG
+    fps: 30
