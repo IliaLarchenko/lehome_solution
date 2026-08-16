@@ -119,15 +119,19 @@ SAFE_REST_DEGREES = np.array([
 # ---------------------------------------------------------------------------
 
 def _patch_realsense() -> None:
-    """bgr8 request + elevated timeout + connect-retry for the D435."""
-    import cv2
+    """rgb8 request + elevated timeout + connect-retry for the D435.
+
+    The stream must be requested as rgb8: lerobot serves frames from the
+    async _read_loop, which bypasses read() and assumes the stream is RGB,
+    so a bgr8 request comes out with red/blue swapped.
+    """
     import pyrealsense2 as rs
 
     def patched_configure(self, rs_config):
         rs.config.enable_device(rs_config, self.serial_number)
         if self.width and self.height and self.fps:
             rs_config.enable_stream(rs.stream.color, self.capture_width,
-                                    self.capture_height, rs.format.bgr8, self.fps)
+                                    self.capture_height, rs.format.rgb8, self.fps)
             if self.use_depth:
                 rs_config.enable_stream(rs.stream.depth, self.capture_width,
                                         self.capture_height, rs.format.z16, self.fps)
@@ -143,9 +147,8 @@ def _patch_realsense() -> None:
         ret, frame = self.rs_pipeline.try_wait_for_frames(timeout_ms=timeout_ms)
         if not ret or frame is None:
             raise RuntimeError(f"{self} read failed (status={ret}).")
-        bgr = np.asanyarray(frame.get_color_frame().get_data())
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return self._postprocess_image(rgb, color_mode)
+        img = np.asanyarray(frame.get_color_frame().get_data())
+        return self._postprocess_image(img)
 
     _rs_cam_mod.RealSenseCamera.read = patched_read
 
@@ -176,6 +179,14 @@ def _patch_realsense() -> None:
 
 
 def _hardware_reset_realsense(yaml_cfg: dict) -> None:
+    """Reset the configured RealSense and wait ~4s for it to come back.
+
+    Opt-in only (``--camera_reset``): on this rig the D435 frequently fails to
+    re-acquire a USB address after a reset ("device not accepting address,
+    error -71"), which parks the calling thread in xhci_setup_device forever —
+    unkillable, and every later USB enumeration blocks behind it until reboot.
+    Replug the camera physically instead when it needs a power cycle.
+    """
     top = yaml_cfg.get("cameras", {}).get("top")
     if not top or (top.get("backend") or "").lower() != "pyrealsense2":
         return
@@ -834,6 +845,12 @@ def main() -> int:
     ap.add_argument("--hf_user",
                     default=os.environ.get("HF_USER", "local"))
     ap.add_argument("--robot_id", default="bimanual_follower")
+    ap.add_argument("--camera_reset", action="store_true",
+                    help="hardware_reset() the RealSense before connecting. OFF by "
+                         "default: on this rig the D435 often fails to re-acquire a "
+                         "USB address afterwards, which wedges the xHCI controller "
+                         "until the machine is rebooted. Prefer replugging the camera "
+                         "physically if it is misbehaving.")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -859,7 +876,8 @@ def main() -> int:
 
     # Patches must come before robot.connect()
     _patch_realsense()
-    _hardware_reset_realsense(yaml_cfg)
+    if args.camera_reset:
+        _hardware_reset_realsense(yaml_cfg)
 
     # Build configs. use_degrees=True so both arms speak the same units as the
     # organizer dataset (data/lehome_real/four_types_merged), which was recorded
