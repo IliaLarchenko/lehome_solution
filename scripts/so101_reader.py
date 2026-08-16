@@ -58,6 +58,35 @@ CALIBRATION_DIR = os.path.join(
     "lehome", "devices", "lerobot", ".cache",
 )
 
+# The real-robot runner (record_real_dagger.py) drives these same leader arms
+# from lerobot's default calibration directory, and that copy is the one kept
+# in sync with the hardware. The legacy per-repo ``.cache`` copy has drifted:
+# its gripper ranges are ~3x narrower than the arms' real travel, which shows
+# up in sim as a gripper reading half-open while physically closed. Prefer the
+# real-robot calibration and fall back to the old cache only if it is absent.
+_LEROBOT_LEADER_CALIBRATION = {
+    "left": "bimanual_leader_left.json",
+    "right": "bimanual_leader_right.json",
+}
+
+
+def _lerobot_calibration_dir() -> str:
+    """Resolve lerobot's teleoperator calibration dir without importing lerobot."""
+    base = os.environ.get("HF_LEROBOT_CALIBRATION")
+    if not base:
+        hf_home = os.environ.get(
+            "HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        )
+        base = os.path.join(hf_home, "lerobot", "calibration")
+    return os.path.join(base, "teleoperators", "so_leader")
+
+
+def default_calibration(side: str) -> str:
+    path = os.path.join(_lerobot_calibration_dir(), _LEROBOT_LEADER_CALIBRATION[side])
+    if os.path.exists(path):
+        return path
+    return f"{side}_so101_leader.json"
+
 
 def load_calibration(filename_or_path: str) -> dict[str, MotorCalibration]:
     # Treat as absolute path if it looks like one, otherwise resolve against
@@ -114,10 +143,12 @@ def main():
     parser = argparse.ArgumentParser(description="SO101 dual-arm leader reader")
     parser.add_argument("--left_port", default="/dev/ttyACM0")
     parser.add_argument("--right_port", default="/dev/ttyACM1")
-    parser.add_argument("--left_calibration", default="left_so101_leader.json",
-                        help="Path to left-arm calibration JSON, or bare filename in default .cache/.")
-    parser.add_argument("--right_calibration", default="right_so101_leader.json",
-                        help="Path to right-arm calibration JSON, or bare filename in default .cache/.")
+    parser.add_argument("--left_calibration", default=default_calibration("left"),
+                        help="Path to left-arm calibration JSON, or bare filename in default .cache/. "
+                             "Defaults to the real-robot (lerobot) calibration when present.")
+    parser.add_argument("--right_calibration", default=default_calibration("right"),
+                        help="Path to right-arm calibration JSON, or bare filename in default .cache/. "
+                             "Defaults to the real-robot (lerobot) calibration when present.")
     parser.add_argument("--hz", type=int, default=100, help="Reading rate")
     parser.add_argument("--max_readings", type=int, default=0,
                         help="Stop after N readings (0 = run until SIGINT).")
@@ -125,6 +156,8 @@ def main():
 
     left_cal = load_calibration(args.left_calibration)
     right_cal = load_calibration(args.right_calibration)
+    print(f"[so101_reader] left calibration:  {args.left_calibration}", file=sys.stderr, flush=True)
+    print(f"[so101_reader] right calibration: {args.right_calibration}", file=sys.stderr, flush=True)
 
     left_bus = create_bus(args.left_port, left_cal)
     right_bus = create_bus(args.right_port, right_cal)

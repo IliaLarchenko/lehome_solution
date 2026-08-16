@@ -69,7 +69,58 @@ ensure_isaacsim_env(REPO_ROOT)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-SIM_INIT_TIMEOUT = 300
+# Boot deadline for wait_for_sim_ready. A healthy boot reaches the ready
+# marker 30-60s after launch; a wedged Isaac never reaches it at all, so a
+# generous deadline only delays the reboot retry.
+SIM_BOOT_TIMEOUT = 150
+# Deadline for a single restore (env.reset + settle + particle restore). A
+# healthy restore finishes in 5-30s; a wedged sim never finishes.
+RESTORE_TIMEOUT = 120
+# A sim whose HTTP long-poll sits idle for minutes can abort (native abort ->
+# IsaacLab's recursive close handler) the moment it is next touched. Feed every
+# waiting sim a hold-position step at this interval so no poll goes stale.
+KEEPALIVE_IDLE = 20.0
+
+
+def log_proc_diag(pid: int, label: str):
+    """Log kernel-side thread states of a stuck process (no ptrace needed).
+
+    For a hang with idle CPU this tells us WHAT it is blocked on:
+    futex_wait = deadlock, poll/select/sock = network or pipe I/O,
+    io_schedule = disk. One line per non-sleeping/interesting thread.
+    """
+    import glob as _glob
+    try:
+        rows = []
+        for tdir in sorted(_glob.glob(f"/proc/{pid}/task/*"))[:64]:
+            tid = tdir.rsplit("/", 1)[1]
+            try:
+                comm = open(f"{tdir}/comm").read().strip()
+                wchan = open(f"{tdir}/wchan").read().strip() or "-"
+                state = open(f"{tdir}/stat").read().split(")")[-1].split()[0]
+            except OSError:
+                continue
+            rows.append((tid, comm, state, wchan))
+        main = [r for r in rows if r[0] == str(pid)]
+        interesting = [r for r in rows
+                       if r[2] not in ("S",) or r[3] not in ("-", "futex_wait_queue")]
+        logger.warning("[diag %s] pid=%d threads=%d", label, pid, len(rows))
+        for tid, comm, state, wchan in (main + interesting)[:20]:
+            logger.warning("[diag %s]   tid=%s comm=%-18s state=%s wchan=%s",
+                           label, tid, comm, state, wchan)
+        # Histogram of wchans across all threads — the blocked majority shows here
+        from collections import Counter
+        hist = Counter(f"{r[2]}:{r[3]}" for r in rows)
+        logger.warning("[diag %s]   wchan histogram: %s", label,
+                       dict(hist.most_common(8)))
+    except Exception as e:
+        logger.warning("[diag %s] failed: %s", label, e)
+# How many failure states to try before giving up on starting a session. A
+# corrupt/mismatched NPZ should cost one skip, not the whole run.
+_FIRST_RESTORE_ATTEMPTS = 5
+# Reboot retries for a sim that wedges during Isaac startup (nondeterministic;
+# consecutive wedges happen). Each failed attempt costs SIM_BOOT_TIMEOUT.
+_SIM_START_ATTEMPTS = 4
 DAGGER_BASE_DIR = REPO_ROOT / "outputs" / "dagger_episodes"
 DAGGER_HF_PREFIX = "dagger"  # folder prefix in HF dataset repo
 
@@ -791,6 +842,12 @@ def start_sim(
         "LEHOME_NO_DEPTH": "1",
         "LEHOME_CHECK_INTERVAL": "30",
         "LEHOME_GARMENT_AUGMENTATION": "1",  # augmentor must be active to re-apply saved augs
+        # ...but nothing may be randomized on top of it during manual collection:
+        # the human teleoperates what they see, so a per-step colour tint would
+        # both distract the operator and inject visual noise into the recording.
+        # ``step_color_tint`` defaults to True in the augmentor, so turn it off
+        # explicitly (all other knobs already default to 0.0 / disabled).
+        "LEHOME_AUG_CONFIG": json.dumps({"step_color_tint": False}),
         "LEHOME_REMOTE_URL": remote_url,
         "LEHOME_WORKER_LABEL": f"W{sim_id}",
     }
@@ -845,23 +902,51 @@ def start_sim(
     return proc, log_fh
 
 
-def wait_for_sim_ready(proc: subprocess.Popen, log_fh) -> bool:
-    """Wait for Isaac Sim to finish loading. Returns True if ready."""
+def wait_for_sim_ready(proc: subprocess.Popen, log_fh, on_wait=None) -> bool:
+    """Wait for Isaac Sim to finish loading. Returns True if ready.
+
+    ``on_wait`` (optional) is called about once per second while waiting so a
+    foreground caller can keep the UI repainting during a ~60s boot. Must only
+    be passed from the main thread (it runs OpenCV calls).
+    """
     t0 = time.time()
-    while time.time() - t0 < SIM_INIT_TIMEOUT:
+    last_line = ""
+    next_note = 30.0
+    n_err_logged = 0
+    while time.time() - t0 < SIM_BOOT_TIMEOUT:
+        if on_wait is not None:
+            on_wait()
         ready, _, _ = select.select([proc.stdout], [], [], 1.0)
         if ready:
             line = proc.stdout.readline()
             if not line:
+                logger.error("Sim boot: stdout closed (proc exit=%s, %.0fs, last: %s)",
+                             proc.poll(), time.time() - t0, last_line[:120])
                 return False
             log_fh.write(line)
             log_fh.flush()
+            if line.strip():
+                last_line = line.strip()
             if "remote-driven session" in line:
                 logger.info(f"Isaac Sim ready ({time.time() - t0:.0f}s)")
                 return True
-            if "Error" in line and "PATCH" not in line:
-                logger.warning(f"Sim error: {line.strip()}")
-    logger.error(f"Sim did not become ready in {SIM_INIT_TIMEOUT}s")
+            if ("Error" in line and "PATCH" not in line
+                    and "attachShape" not in line):  # attachShape is benign boot noise
+                n_err_logged += 1
+                if n_err_logged <= 10:
+                    logger.warning(f"Sim error: {line.strip()}")
+                elif n_err_logged == 11:
+                    logger.warning("Sim error: (further error lines suppressed; "
+                                   "see the isaac_sim_*.log)")
+        elapsed = time.time() - t0
+        if elapsed >= next_note:
+            logger.info("Sim boot: %.0fs elapsed, proc=%s, last output: %s",
+                        elapsed, "alive" if proc.poll() is None else f"exit={proc.poll()}",
+                        last_line[:120])
+            next_note += 30.0
+    logger.error(f"Sim did not become ready in {SIM_BOOT_TIMEOUT}s "
+                 f"(last output: {last_line[:160]})")
+    log_proc_diag(proc.pid, "boot-wedge")
     return False
 
 
@@ -905,8 +990,28 @@ def _build_remote_task(failure: dict) -> dict:
         task["restore_data"] = rd
         task["restore_mode"] = "lifted"
         if failure.get("augmentation"):
-            task["augmentation"] = failure["augmentation"]
+            task["augmentation"] = _strip_visual_augmentation(failure["augmentation"])
     return task
+
+
+# Saved-augmentation keys that only affect how the garment *looks*. Everything
+# else in the dict (pos_offset/rot_offset/scale_factor, camera_jitter,
+# arm_shift, ...) is geometric: the failure state's particle positions were
+# recorded with it applied, so dropping those would desync the restore.
+_VISUAL_AUG_KEYS = ("pattern_swap", "pattern_indices", "color_remap", "color_seed")
+
+
+def _strip_visual_augmentation(aug: dict) -> dict:
+    """Drop texture swap / colour remap from a saved augmentation.
+
+    Both rebind textures, and RTX loads textures asynchronously — so the first
+    rendered frame still shows the original material and the swap only lands a
+    frame or two later. During autonomous rollouts nobody is looking; during
+    manual collection it reads as the garment changing colour the moment you
+    start recording. The operator teleoperates what they see, so the visuals
+    are pinned to the default material and only the geometry is replayed.
+    """
+    return {k: v for k, v in aug.items() if k not in _VISUAL_AUG_KEYS}
 
 
 def _dagger_success(check_status, garment_type: str) -> bool:
@@ -986,13 +1091,21 @@ class SimInstance:
         self._pending_snapshot: dict | None = None
         self._active = False
         self._skip = False
+        # Serializes protocol exchanges (keepalive thread vs controller); the
+        # generation counter invalidates zombie background loads after reboot.
+        self._io_lock = threading.Lock()
+        self._gen = 0
+        self._last_exchange = time.time()
         server.sessions[self.session_id] = self
 
     def start(
         self, first_garment: str, first_garment_type: str, seed: int,
-        output_dir: Path, args,
+        output_dir: Path, args, on_wait=None,
     ) -> bool:
         """Start the Isaac Sim subprocess (it connects back to the shared server)."""
+        logger.info("Booting sim %d: garment=%s seed=%s",
+                    self.sim_id, first_garment, seed)
+        t_boot = time.time()
         try:
             self.proc, self.log_fh = start_sim(
                 first_garment=first_garment,
@@ -1005,8 +1118,13 @@ class SimInstance:
                 session_id=self.session_id,
                 sim_id=self.sim_id,
             )
-            if not wait_for_sim_ready(self.proc, self.log_fh):
+            if not wait_for_sim_ready(self.proc, self.log_fh, on_wait=on_wait):
                 logger.error("Sim %d failed to start", self.sim_id)
+                # Reap it. A sim that missed its startup deadline is usually
+                # still alive and still holding ~12 GB plus its GPU context —
+                # leaving it running starves the sims that did come up, which
+                # is what turns one slow start into a cascade of them.
+                self._kill_proc()
                 return False
 
             # Start background log reader
@@ -1018,6 +1136,7 @@ class SimInstance:
 
             # Start liveness watcher
             self.start_ping()
+            logger.info("Sim %d boot complete in %.0fs", self.sim_id, time.time() - t_boot)
 
             logger.info("Sim %d ready (session %s)", self.sim_id, self.session_id)
             return True
@@ -1051,14 +1170,30 @@ class SimInstance:
 
     # -- controller-thread API (unchanged signatures) -----------------------
 
-    def send_restore(self, failure: dict) -> bool:
+    def send_restore(self, failure: dict, on_wait=None) -> bool:
         """Assign a failure to this sim, block until its first observation.
 
         Returns True on success, False on error/skip. Same semantics as before;
         the transport is now the remote protocol (the sim drives, this answers).
+
+        ``on_wait`` is called repeatedly while blocked. A restore can take tens
+        of seconds, and the caller runs the OpenCV event loop, so without this
+        the window stops repainting and the WM greys it out as hung.
         """
+        t_restore = time.time()
+        logger.debug("Sim %d: restore of %s starting (state=%s, proc=%s)",
+                     self.sim_id, failure["garment"], self.state,
+                     "alive" if self.proc_alive() else "DEAD")
         self.current_failure = failure
         task = _build_remote_task(failure)
+        # Drain any stale observation left by a timed-out earlier exchange —
+        # consuming it later as this restore's response would silently hand
+        # the controller the wrong garment's state.
+        while True:
+            try:
+                self._obs_q.get_nowait()
+            except queue.Empty:
+                break
         with self._lock:
             if self._active:
                 # End the current episode so the sim loops back to /next_task.
@@ -1066,9 +1201,25 @@ class SimInstance:
                 self._active = False
             self._task_q.put(task)
         try:
-            obs_body = self._obs_q.get(timeout=SIM_INIT_TIMEOUT)
+            if on_wait is None:
+                obs_body = self._obs_q.get(timeout=RESTORE_TIMEOUT)
+            else:
+                deadline = time.time() + RESTORE_TIMEOUT
+                while True:
+                    try:
+                        obs_body = self._obs_q.get(timeout=0.05)
+                        break
+                    except queue.Empty:
+                        if time.time() >= deadline:
+                            raise
+                        on_wait()
         except queue.Empty:
             self.load_error = "restore timeout"
+            logger.warning("Sim %d: restore of %s TIMED OUT after %.0fs (proc=%s)",
+                           self.sim_id, failure["garment"], time.time() - t_restore,
+                           "alive" if self.proc_alive() else "DEAD")
+            if self.proc_alive():
+                log_proc_diag(self.proc.pid, f"restore-wedge-sim{self.sim_id}")
             return False
         if obs_body.get("_restore_skip"):
             self.load_error = "particle_mismatch"
@@ -1077,6 +1228,9 @@ class SimInstance:
                 self.sim_id, failure["garment"],
             )
             return False
+        self._last_exchange = time.time()
+        logger.info("Sim %d: restore of %s done in %.1fs",
+                    self.sim_id, failure["garment"], time.time() - t_restore)
         self.current_obs = decode_observation(obs_body)
         self.restore_snapshot = self._pending_snapshot
         self.current_failure = failure
@@ -1084,10 +1238,53 @@ class SimInstance:
         self._active = True
         return True
 
-    def send_step(self, action: np.ndarray, n_steps: int = 1) -> dict:
-        """Apply an action, return the resulting observation (+ success/steps_done)."""
+    def hold_step(self) -> bool:
+        """One hold-position step (keepalive). Returns False on failure."""
+        if self.current_obs is None:
+            return True  # nothing to hold against; nothing to keep alive either
+        state = self.current_obs.get("observation.state")
+        if state is None:
+            return True
+        if not bool(np.all(np.isfinite(np.asarray(state, dtype=np.float64)))):
+            logger.warning("Sim %d: non-finite state in keepalive — physics "
+                           "blew up while idle", self.sim_id)
+            return False
+        try:
+            action = np.asarray(state, dtype=np.float32).flatten()[:12]
+            resp = self.send_step(action, 1)
+            self.current_obs = decode_observation(resp)
+            return True
+        except Exception as e:
+            logger.warning("Sim %d: keepalive step FAILED (%s)", self.sim_id, e)
+            if self.proc_alive():
+                log_proc_diag(self.proc.pid, f"keepalive-sim{self.sim_id}")
+            return False
+
+    def send_step(self, action: np.ndarray, n_steps: int = 1,
+                  on_wait=None) -> dict:
+        """Apply an action, return the resulting observation (+ success/steps_done).
+
+        ``on_wait`` is called while a slow step is pending (a physics-heavy
+        frame right after a restore can take seconds) so the UI keeps
+        repainting instead of freezing on the operator.
+        """
+        t_step = time.time()
         self._action_q.put({"actions": action.tolist(), "n_steps": n_steps})
-        obs_body = self._obs_q.get(timeout=30)
+        if on_wait is None:
+            obs_body = self._obs_q.get(timeout=30)
+        else:
+            deadline = time.time() + 30
+            while True:
+                try:
+                    obs_body = self._obs_q.get(timeout=0.5)
+                    break
+                except queue.Empty:
+                    if time.time() >= deadline:
+                        raise
+                    on_wait()
+        self._last_exchange = time.time()
+        if time.time() - t_step > 2.0:
+            logger.warning("Sim %d: slow step %.1fs", self.sim_id, time.time() - t_step)
         resp = dict(obs_body)
         resp["steps_done"] = n_steps
         gt = (self.current_failure or {}).get("garment_type", "")
@@ -1114,6 +1311,50 @@ class SimInstance:
         self._ping_thread = threading.Thread(target=_loop, daemon=True)
         self._ping_thread.start()
 
+    def proc_alive(self) -> bool:
+        return bool(self.proc) and self.proc.poll() is None
+
+    def _kill_proc(self):
+        """SIGTERM then SIGKILL this sim's process group, if still alive."""
+        if not (self.proc and self.proc.poll() is None):
+            return
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                self.proc.wait(timeout=3)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def reset_for_reboot(self):
+        """Make this instance reusable after ``shutdown()``.
+
+        ``shutdown()`` leaves three landmines for a rebooted process: the
+        session is deregistered from the server (its HTTP calls would 404),
+        and the task/action queues hold the poison ``{"shutdown"}`` /
+        ``{"stop"}`` messages — a fresh sim would consume them and exit
+        immediately. Drain everything and re-register.
+        """
+        # Fresh queue objects (not just drained): zombie threads from the old
+        # incarnation still block on the old queues and must never steal a
+        # message meant for the new process.
+        self._gen += 1
+        self._task_q = queue.Queue()
+        self._action_q = queue.Queue()
+        self._obs_q = queue.Queue()
+        self._pending_snapshot = None
+        self._active = False
+        self._skip = False
+        self.load_error = None
+        self.current_failure = None
+        self.current_obs = None
+        self.state = "idle"
+        self.server.sessions[self.session_id] = self
+
     def shutdown(self):
         """Shutdown this sim instance."""
         self._ping_running = False
@@ -1126,18 +1367,7 @@ class SimInstance:
         except Exception:
             pass
         self.server.sessions.pop(self.session_id, None)
-        if self.proc and self.proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                    self.proc.wait(timeout=3)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        self._kill_proc()
         if self.log_fh:
             self.log_fh.close()
             self.log_fh = None
@@ -1173,36 +1403,124 @@ class SimPool:
         self.args = args
         self._active_idx = 0
         self._load_threads: dict[int, threading.Thread] = {}
+        # ensure_preloaded is called from both the main loop and the background
+        # boot thread (start_rest_async); the lock keeps queue-peek + sim
+        # assignment atomic so two callers can't assign the same failure twice.
+        self._preload_lock = threading.Lock()
+        self._boot_thread: threading.Thread | None = None
+        self._abort_boot = False
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="sim_keepalive")
+        self._keepalive_thread.start()
 
-    def start_all(self, first_failure: dict, output_dir: Path) -> bool:
-        """Start all sims sequentially. Returns True if at least 1 started.
+    def _keepalive_loop(self):
+        """Hold-step every pre-loaded ("ready") sim before its poll goes stale.
 
-        Garment list file lock in start_sim ensures proper sequencing
-        (matches eval_worker pattern).
+        The active sim is kept alive by the controller's own wait loops (main
+        thread); this thread only touches "ready" sims, under the sim's
+        _io_lock so a concurrent switch-to-active can never interleave.
+        """
+        while not self._abort_boot:
+            time.sleep(5)
+            for sim in self.sims:
+                if sim.state != "ready" or not sim.proc_alive():
+                    continue
+                if time.time() - sim._last_exchange < KEEPALIVE_IDLE:
+                    continue
+                with sim._io_lock:
+                    if sim.state != "ready":
+                        continue
+                    if not sim.hold_step():
+                        sim.state = "error"
+
+    def _start_one(self, sim: SimInstance, first_failure: dict,
+                   output_dir: Path, on_wait=None) -> bool:
+        """Start a single sim, retrying once if Isaac wedges during startup.
+
+        Isaac occasionally finishes scene setup, then goes silent and never
+        reaches the ready marker, while its siblings do the identical work in
+        ~30s. It's not reproducible against a particular sim index, so retry
+        before giving up: a lost sim costs a pre-load slot for the session.
         """
         garment = first_failure["garment"]
         garment_type = first_failure["garment_type"]
         seed = first_failure["seed"]
-        ok_count = 0
-        for sim in self.sims:
-            if sim.start(garment, garment_type, seed, output_dir, self.args):
-                ok_count += 1
-            else:
-                sim.state = "dead"
-        logger.info("SimPool: %d/%d sims started", ok_count, self.num_sims)
-        return ok_count > 0
+        for attempt in range(_SIM_START_ATTEMPTS):
+            if self._abort_boot:
+                return False
+            if sim.start(garment, garment_type, seed, output_dir, self.args,
+                         on_wait=on_wait):
+                return True
+            if attempt + 1 < _SIM_START_ATTEMPTS and not self._abort_boot:
+                logger.warning("Sim %d failed to start — retrying (%d/%d)",
+                               sim.sim_id, attempt + 2, _SIM_START_ATTEMPTS)
+        sim.state = "dead"
+        return False
+
+    def start_first(self, first_failure: dict, output_dir: Path) -> bool:
+        """Start sim 0 only (foreground). Returns True on success.
+
+        The remaining sims boot afterwards via ``start_rest_async`` — the
+        operator should not wait several minutes of sequential Isaac boots
+        before the first episode, and a sim left idling in its ``/next_task``
+        long-poll for that long has been observed to die the moment the task
+        finally arrives. Booting one sim and immediately giving it work keeps
+        every idle window short.
+        """
+        ok = self._start_one(self.sims[0], first_failure, output_dir)
+        logger.info("SimPool: sim 0 %s", "started" if ok else "FAILED")
+        return ok
+
+    def start_rest_async(self, first_failure: dict, output_dir: Path,
+                         queue: 'FailureQueue'):
+        """Boot sims 1..N-1 in a background thread (sequential, like before).
+
+        As each sim becomes ready it is *immediately* given the next failure
+        from the queue (``ensure_preloaded``), so no sim ever sits idle in its
+        ``/next_task`` long-poll — that idle window is what killed sims when
+        all boots happened before the first restore.
+        """
+        if self.num_sims <= 1:
+            return
+
+        def _boot():
+            ok_count = 1 if self.sims[0].state != "dead" else 0
+            for sim in self.sims[1:]:
+                if self._abort_boot:
+                    return
+                if self._start_one(sim, first_failure, output_dir):
+                    ok_count += 1
+                    # Hand this sim work right away (offset 1: sim 0 holds
+                    # queue.current()). Thread-safe via _preload_lock.
+                    self.ensure_preloaded(queue, start_offset=1)
+            logger.info("SimPool: %d/%d sims started", ok_count, self.num_sims)
+
+        self._boot_thread = threading.Thread(
+            target=_boot, daemon=True, name="sim_boot")
+        self._boot_thread.start()
 
     def get_active(self) -> SimInstance:
         return self.sims[self._active_idx]
 
     def load_in_background(self, sim: SimInstance, failure: dict):
         """Start background restore on a sim."""
+        if not sim.proc_alive():
+            logger.warning("Sim %d has no live process — not assigning %s",
+                           sim.sim_id, failure["garment"])
+            return
+        logger.debug("Sim %d: assigning background pre-load of %s",
+                     sim.sim_id, failure["garment"])
         sim.state = "loading"
         sim.current_failure = failure
         sim.load_error = None
+        gen = sim._gen
 
         def _do_load():
             ok = sim.send_restore(failure)
+            if sim._gen != gen:
+                logger.info("Sim %d: stale background load discarded (%s)",
+                            sim.sim_id, failure["garment"])
+                return
             if ok:
                 sim.state = "ready"
                 logger.info(
@@ -1219,8 +1537,13 @@ class SimPool:
         t.start()
         self._load_threads[sim.sim_id] = t
 
-    def advance(self, target_failure: dict, timeout: float = 60) -> SimInstance | None:
-        """Switch to a sim that has target_failure pre-loaded. Returns new active sim or None."""
+    def advance(self, target_failure: dict, timeout: float = 60,
+                on_wait=None) -> SimInstance | None:
+        """Switch to a sim that has target_failure pre-loaded. Returns new active sim or None.
+
+        ``on_wait`` is pumped while polling so the UI stays responsive; see
+        ``SimInstance.send_restore``.
+        """
         target_key = _failure_key(target_failure)
         t0 = time.time()
         while time.time() - t0 < timeout:
@@ -1230,8 +1553,13 @@ class SimPool:
                 sim = self.sims[idx]
                 if (sim.state == "ready" and sim.current_failure is not None
                         and _failure_key(sim.current_failure) == target_key):
-                    sim.state = "active"
+                    with sim._io_lock:
+                        if sim.state != "ready":
+                            continue  # keepalive just failed it
+                        sim.state = "active"
                     self._active_idx = idx
+                    logger.info("Switched to pre-loaded sim %d (%s) in %.1fs",
+                                sim.sim_id, target_failure["garment"], time.time() - t0)
                     return sim
             # Check if any sim is loading the target
             any_loading_target = any(
@@ -1242,7 +1570,10 @@ class SimPool:
             if not any_loading_target:
                 # Nobody is loading our target — bail immediately
                 return None
-            time.sleep(0.2)  # poll
+            if on_wait is not None:
+                on_wait()  # repaints the window, and blocks ~50ms doing so
+            else:
+                time.sleep(0.2)  # poll
         logger.error("SimPool: target sim not ready in %.0fs", timeout)
         return None
 
@@ -1255,9 +1586,17 @@ class SimPool:
                 is no active sim (between episodes), 1 when an active sim already
                 has queue.current() loaded.
         """
-        # Collect available sims (not active, not dead/error)
+        with self._preload_lock:
+            self._ensure_preloaded_locked(queue, start_offset)
+
+    def _ensure_preloaded_locked(self, queue: 'FailureQueue', start_offset: int):
+        # Collect available sims (not active, not dead/error). proc_alive()
+        # matters: sims boot in the background now, and an unbooted sim also
+        # reads state=="idle" — assigning it a task posts into a queue nobody
+        # is polling, and the sim later swallows the stale task on its first
+        # poll after boot (observed: preload timeout + wrong-garment restore).
         available = [s for s in self.sims
-                     if s.state in ("idle", "ready", "loading")]
+                     if s.state in ("idle", "ready", "loading") and s.proc_alive()]
 
         if not available:
             return
@@ -1289,6 +1628,11 @@ class SimPool:
 
     def shutdown_all(self):
         """Shutdown all sim instances and the shared server."""
+        self._abort_boot = True
+        if self._boot_thread and self._boot_thread.is_alive():
+            # Give the boot thread a moment to notice; a sim mid-boot is
+            # killed below regardless (shutdown() kills the process group).
+            self._boot_thread.join(timeout=10)
         for sim in self.sims:
             if sim.state != "dead":
                 sim.shutdown()
@@ -1326,6 +1670,51 @@ def decode_observation(msg: dict) -> dict:
 # UI display
 # ---------------------------------------------------------------------------
 
+# Foot-pedal arrow keys, same convention as record_real_dagger.py:
+#   left pedal   -> LEFT arrow  -> drop this episode, straight on to the next
+#   middle pedal -> SPACE       -> pause / resume
+#   right pedal  -> RIGHT arrow -> save and advance to the next failure state
+# The raw code differs per OpenCV GUI backend (Qt: 0x250000/0x270000,
+# GTK: 65361/65363), so both are accepted.
+_PEDAL_DROP_CODES = frozenset({0x250000, 65361})
+_PEDAL_SAVE_NEXT_CODES = frozenset({0x270000, 65363})
+
+# F11 toggles fullscreen. Qt reports Qt::Key_F11, GTK reports GDK_KEY_F11
+# (0xFFC8) — which is what this build actually sends, despite linking Qt5.
+_FULLSCREEN_CODES = frozenset({0x01000034, 0xFFC8})
+
+# Sentinel returned for fullscreen; outside both the 0-255 ASCII range that
+# every other binding lives in and the -1 "no key" value, so it can never
+# collide with a real binding.
+KEY_FULLSCREEN = 0x0F11
+
+_unknown_keys_seen: set[int] = set()
+
+
+def _normalize_key(code: int) -> int:
+    """Fold the pedal's arrow keys and F11 onto the plain ASCII key bindings.
+
+    Reading them needs ``waitKeyEx`` — plain ``waitKey() & 0xFF`` collapses
+    the arrows to 0 on the Qt backend. Everything else keeps the historical
+    ``& 0xFF`` behaviour so the rest of the controller still compares against
+    ordinary ASCII.
+    """
+    if code < 0:
+        return -1
+    if code in _PEDAL_DROP_CODES:
+        return ord("f")  # KEY_SKIP
+    if code in _PEDAL_SAVE_NEXT_CODES:
+        return ord("s")  # KEY_SAVE_SEMI
+    if code in _FULLSCREEN_CODES:
+        return KEY_FULLSCREEN
+    if code > 0xFF and code not in _unknown_keys_seen:
+        # Log once per code so an unrecognised pedal/keyboard can be mapped
+        # without guessing at backend-specific key codes.
+        _unknown_keys_seen.add(code)
+        logger.info("Unmapped key code %d (0x%X) — ignoring", code, code)
+    return code & 0xFF
+
+
 class DaggerUI:
     """OpenCV window for camera display and status."""
 
@@ -1342,10 +1731,13 @@ class DaggerUI:
     def __init__(self, camera_width: int, camera_height: int):
         self.cam_w = camera_width
         self.cam_h = camera_height
+        self.pool = None  # set by the controller once the SimPool exists
         self._state = "IDLE"
         self._success_timer = 0.0
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(self.WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        self._fullscreen = True
+        self._fullscreen_applied = False
+        self._apply_fullscreen()
         # Detect screen resolution for image scaling
         # Fallback to 1920x1080 if detection fails
         self._screen_w = 1920
@@ -1361,6 +1753,24 @@ class DaggerUI:
                     break
         except Exception:
             pass
+
+    def _apply_fullscreen(self):
+        if self._fullscreen:
+            # Setting the property to the value it already holds is a no-op in
+            # the backend, so the window would stay decorated. Bounce it
+            # through NORMAL to force the WM to act on the change.
+            cv2.setWindowProperty(
+                self.WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(
+            self.WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if self._fullscreen else cv2.WINDOW_NORMAL,
+        )
+
+    def toggle_fullscreen(self):
+        """F11: flip between fullscreen and a normal resizable window."""
+        self._fullscreen = not self._fullscreen
+        self._apply_fullscreen()
+        logger.info("Fullscreen %s", "on" if self._fullscreen else "off")
 
     @property
     def state(self):
@@ -1441,7 +1851,9 @@ class DaggerUI:
         left_panel = np.zeros((cam_h_total, arm_panel_w, 3), dtype=np.uint8)
         right_panel = np.zeros((cam_h_total, arm_panel_w, 3), dtype=np.uint8)
 
-        if joint_state is not None and len(joint_state) >= 12:
+        if (joint_state is not None and len(joint_state) >= 12
+                and bool(np.all(np.isfinite(np.asarray(joint_state[:12],
+                                                       dtype=np.float64))))):
             left_joints = np.asarray(joint_state[:6], dtype=np.float64)
             right_joints = np.asarray(joint_state[6:12], dtype=np.float64)
 
@@ -1492,10 +1904,15 @@ class DaggerUI:
         status_bar[:] = (30, 30, 30)
 
         sim_time = frame_idx / 30.0
+        sims_txt = ""
+        if self.pool is not None:
+            usable = sum(1 for s in self.pool.sims
+                         if s.state in ("active", "ready") and s.proc_alive())
+            sims_txt = f" | sims:{usable}/{len(self.pool.sims)}"
         text = (
             f"{self._state} | {garment_name} | "
             f"{sim_time:.1f}s | Q:{queue_pos} | "
-            f"D:{done_count} S:{success_count}"
+            f"D:{done_count} S:{success_count}{sims_txt}"
         )
         cv2.putText(
             status_bar, text, (5, 20),
@@ -1525,7 +1942,19 @@ class DaggerUI:
         cv2.imshow(self.WINDOW_NAME, canvas)
 
         wait_ms = 50 if self._state == "PAUSED" else 1
-        return cv2.waitKey(wait_ms) & 0xFF
+        key = _normalize_key(cv2.waitKeyEx(wait_ms))
+
+        if not self._fullscreen_applied:
+            # Window managers ignore the fullscreen hint set before the window
+            # is first mapped, which is why it otherwise opens as a small
+            # floating window. Re-apply once the first frame has been shown.
+            self._fullscreen_applied = True
+            self._apply_fullscreen()
+
+        if key == KEY_FULLSCREEN:
+            self.toggle_fullscreen()
+            return -1
+        return key
 
     @staticmethod
     def _to_uint8(img):
@@ -1621,12 +2050,14 @@ class EpisodeRecorder:
 class DaggerController:
     """Orchestrates the DAgger collection process."""
 
-    # Key bindings
-    KEY_PAUSE = ord(" ")       # SPACE: pause/resume recording
-    KEY_SKIP = ord("f")        # F: skip episode (no save, no delete)
-    KEY_RETRY = ord("r")       # R: retry same episode
-    KEY_SAVE_SEMI = ord("s")   # S: save to semi_success folder
-    KEY_DISCARD = ord("d")     # D: discard (delete failure NPZ)
+    # Key bindings. The three pedal keys are folded onto these in
+    # ``_normalize_key``: LEFT arrow -> KEY_SKIP, RIGHT arrow -> KEY_SAVE_SEMI.
+    KEY_PAUSE = ord(" ")       # SPACE / middle pedal: pause/resume recording
+    KEY_SKIP = ord("f")        # F / left pedal: drop episode, on to the next
+                               #   (nothing saved, failure NPZ left in the pool)
+    KEY_RETRY = ord("r")       # R: re-record the same failure state
+    KEY_SAVE_SEMI = ord("s")   # S / right pedal: save to semi_success and advance
+    KEY_DISCARD = ord("d")     # D: discard AND delete the failure NPZ from disk
     KEY_QUIT = 27              # ESC: quit session
 
     def __init__(self, args):
@@ -1816,10 +2247,13 @@ class DaggerController:
         )
 
         try:
-            # Start sim pool
+            # Start sim 0 only; the first restore goes out the moment it is
+            # ready. Sims 1..N-1 boot in the background (start_rest_async in
+            # _main_loop, once the queue's head is pinned by the first restore).
             self._sim_pool = SimPool(self._num_sims, self.args)
-            if not self._sim_pool.start_all(first, self.output_dir):
-                logger.error("Failed to start any Isaac Sim instances")
+            self.ui.pool = self._sim_pool
+            if not self._sim_pool.start_first(first, self.output_dir):
+                logger.error("Failed to start Isaac Sim 0")
                 return
 
             # Start SO101 reader
@@ -2027,13 +2461,14 @@ class DaggerController:
             return
 
         active_sim.state = "active"
-        logger.info("Loading first failure on sim 0...")
-        if not active_sim.send_restore(first_failure):
+        if not self._first_restore_with_recovery(active_sim):
             logger.error("Failed to load first failure")
             return
+        first_failure = self.queue.current()  # may have advanced past bad NPZs
 
-        # Pre-load next failures on remaining sims (background)
-        pool.ensure_preloaded(self.queue)
+        # Sim 0 is live and the operator can start working. Boot the remaining
+        # sims now, in the background; each is preloaded the moment it's ready.
+        pool.start_rest_async(first_failure, self.output_dir, self.queue)
 
         consecutive_errors = 0
         while True:
@@ -2046,6 +2481,9 @@ class DaggerController:
             self._drain_save_futures()
 
             result = self._process_failure(failure, active_sim)
+            logger.info("Episode done: %s -> %s [sims: %s]",
+                        failure["garment"], result,
+                        ",".join(f"{sm.sim_id}:{sm.state}" for sm in pool.sims))
 
             # Track consecutive errors (timeouts, step failures)
             if result == "error":
@@ -2123,8 +2561,7 @@ class DaggerController:
                         # All sims dead/error/loading other things — foreground
                         logger.warning("No available sim for %s — foreground on sim %d",
                                        next_failure["garment"], old_sim.sim_id)
-                        old_sim.state = "active"
-                        if old_sim.send_restore(next_failure):
+                        if self._revive_and_restore(old_sim, next_failure):
                             active_sim = old_sim
                         else:
                             logger.error("Foreground restore failed")
@@ -2134,12 +2571,13 @@ class DaggerController:
                         continue
 
                 # Wait for the target sim to become ready
-                new_sim = pool.advance(next_failure, timeout=60)
+                new_sim = pool.advance(
+                    next_failure, timeout=60,
+                    on_wait=lambda: self._pump_ui(next_failure["garment"]))
                 if new_sim is None:
                     logger.warning("Sim loading %s timed out — foreground on sim %d",
                                    next_failure["garment"], old_sim.sim_id)
-                    old_sim.state = "active"
-                    if old_sim.send_restore(next_failure):
+                    if self._revive_and_restore(old_sim, next_failure):
                         active_sim = old_sim
                     else:
                         logger.error("Foreground restore failed")
@@ -2154,6 +2592,86 @@ class DaggerController:
             pool.ensure_preloaded(self.queue, start_offset=1)
 
         pool.shutdown_all()
+
+    def _revive_and_restore(self, sim: SimInstance, failure: dict) -> bool:
+        """Foreground fallback: make ``sim`` usable for ``failure``, whatever
+        state it is in — reboot first when it is mid-load, erroring, or dead
+        (a sim stuck "loading" is almost always in the abort-spin)."""
+        pump = lambda g=failure["garment"]: self._pump_ui(g)  # noqa: E731
+        if sim.state in ("loading", "error", "dead") or not sim.proc_alive():
+            logger.warning("Sim %d unusable (state=%s, proc=%s) — rebooting",
+                           sim.sim_id, sim.state,
+                           "alive" if sim.proc_alive() else "dead")
+            sim.shutdown()
+            sim.reset_for_reboot()
+            if not self._sim_pool._start_one(sim, failure, self.output_dir,
+                                             on_wait=pump):
+                return False
+        sim.state = "active"
+        return sim.send_restore(failure, on_wait=pump)
+
+    def _first_restore_with_recovery(self, sim: SimInstance) -> bool:
+        """Load the session's first failure state, surviving Isaac wedges.
+
+        Isaac occasionally wedges or silently dies during boot or the first
+        ``env.reset`` — the process either never reaches the ready marker or
+        goes quiet mid-reset. Both leave the recorder with nothing to show.
+        Recovery: reboot the sim and retry the SAME state (a wedge says
+        nothing about the NPZ). Only a genuine particle-count mismatch — sim
+        alive, restore explicitly skipped — advances the queue. The UI keeps
+        repainting throughout.
+        """
+        for attempt in range(1, _FIRST_RESTORE_ATTEMPTS + 1):
+            failure = self.queue.current()
+            if failure is None:
+                return False  # queue exhausted
+            garment = failure["garment"]
+            pump = lambda g=garment: self._pump_ui(g)  # noqa: E731
+
+            if not sim.proc_alive():
+                logger.info("Rebooting sim %d (attempt %d)...", sim.sim_id, attempt)
+                sim.shutdown()
+                sim.reset_for_reboot()
+                if not self._sim_pool._start_one(sim, failure, self.output_dir,
+                                                 on_wait=pump):
+                    logger.error("Sim %d would not reboot", sim.sim_id)
+                    return False
+                sim.state = "active"
+
+            logger.info("Loading first failure %s on sim %d (attempt %d)...",
+                        garment, sim.sim_id, attempt)
+            if sim.send_restore(failure, on_wait=pump):
+                return True
+
+            if sim.proc_alive() and sim.load_error == "particle_mismatch":
+                # Real NPZ/garment mismatch — the state is bad, the sim is fine.
+                logger.warning("Skipping %s (particle mismatch)", garment)
+                self.queue.skip()
+                continue
+
+            # Wedged (timeout, proc alive) or dead — reboot and retry same state.
+            logger.warning(
+                "First restore of %s failed (%s, proc %s) — rebooting sim",
+                garment, sim.load_error,
+                "alive" if sim.proc_alive() else "dead",
+            )
+            sim.shutdown()
+        return False
+
+    def _pump_ui(self, garment: str):
+        """Repaint the window while a blocking sim restore/advance is running.
+
+        Passed as ``on_wait`` to ``send_restore``/``advance``. Without it the
+        window is frozen for the whole restore — which with ``--num_sims 1`` is
+        every single episode transition, since there is no pre-loaded sim to
+        switch to.
+        """
+        self.ui.state = "RESTORING"
+        self.ui.update(
+            None, garment, 0, self.queue.position_str(), None,
+            self.queue.success_count, self.queue.done_count,
+            joint_state=None,
+        )
 
     def _handle_key_pre_recording(self, key, recorder=None) -> str | None:
         """Handle key press in pre-recording or paused state.
@@ -2208,7 +2726,8 @@ class DaggerController:
                 self.queue.success_count, self.queue.done_count,
                 joint_state=None,
             )
-            if not sim.send_restore(failure):
+            if not sim.send_restore(
+                    failure, on_wait=lambda: self._pump_ui(garment)):
                 if sim.load_error == "particle_mismatch":
                     npz_name = failure.get("npz_filename")
                     if npz_name:
@@ -2221,15 +2740,28 @@ class DaggerController:
 
         # Show initial observation, wait for user
         self.ui.state = "PAUSED"
-        logger.info(f"Ready: {garment} [sim{sim.sim_id}] (SPACE=start, F=skip, D=discard, R=retry, ESC=quit)")
+        logger.info(
+            f"Ready: {garment} [sim{sim.sim_id}] "
+            "(SPACE/mid-pedal=start, RIGHT/right-pedal=save+next, "
+            "LEFT/left-pedal=drop+next, R=re-record, D=delete NPZ, "
+            "F11=fullscreen, ESC=quit)"
+        )
 
-        # Pre-recording wait loop
+        # Pre-recording wait loop. The hold-step keeps the ACTIVE sim's
+        # long-poll fresh while the operator lines up — an idle sim aborts on
+        # the next touch (see KEEPALIVE_IDLE). It also live-updates the view.
+        _last_hold = time.time()
         while True:
             key = self.ui.update(
                 obs, garment, 0, self.queue.position_str(),
                 obs.get("check_status"), self.queue.success_count, self.queue.done_count,
                 joint_state=self._get_joint_state(obs),
             )
+            if time.time() - _last_hold >= KEEPALIVE_IDLE:
+                if not sim.hold_step():
+                    return "error"
+                obs = sim.current_obs or obs
+                _last_hold = time.time()
             result = self._handle_key_pre_recording(key)
             if result == "start_recording":
                 break
@@ -2265,12 +2797,25 @@ class DaggerController:
 
             # Send step to sim
             try:
-                resp = sim.send_step(action, steps_per_batch)
+                resp = sim.send_step(
+                    action, steps_per_batch,
+                    on_wait=lambda: self.ui.update(
+                        obs, garment, sim_step, self.queue.position_str(),
+                        None, self.queue.success_count, self.queue.done_count,
+                        joint_state=self._get_joint_state(obs),
+                    ))
             except Exception as e:
                 logger.error(f"Step failed on sim {sim.sim_id}: {e}")
                 return "error"
 
             obs = decode_observation(resp)
+            _st = obs.get("observation.state")
+            if _st is not None and not bool(np.all(np.isfinite(
+                    np.asarray(_st, dtype=np.float64)))):
+                logger.warning(
+                    "Sim %d returned non-finite joint state at step %d — "
+                    "physics blew up, aborting episode", sim.sim_id, sim_step)
+                return "error"
             check_status = obs.get("check_status")
             if isinstance(check_status, list):
                 check_status = np.array(check_status, dtype=np.float32)
@@ -2324,12 +2869,18 @@ class DaggerController:
                     self.ui.state = "RECORDING"
                 else:
                     self.ui.state = "PAUSED"
+                    _last_hold = time.time()
                     while self.ui.state == "PAUSED":
                         key2 = self.ui.update(
                             obs, garment, sim_step, self.queue.position_str(),
                             check_status, self.queue.success_count, self.queue.done_count,
                             joint_state=self._get_joint_state(obs),
                         )
+                        if time.time() - _last_hold >= KEEPALIVE_IDLE:
+                            if not sim.hold_step():
+                                return "error"
+                            obs = sim.current_obs or obs
+                            _last_hold = time.time()
                         result = self._handle_key_pre_recording(key2, recorder)
                         if result == "start_recording":
                             self.ui.state = "RECORDING"
