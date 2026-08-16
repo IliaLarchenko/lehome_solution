@@ -9,17 +9,19 @@ to validate that your physical camera placement matches the source dataset's
 setup — if the cameras are aligned, the overlay shows ghosting only on
 moving parts (the cloth), not on static features (table edges, robot bases).
 
-The composite is written to ``outputs/real_camera_align/overlay.png`` (override
-with ``--out_dir``); keep that file open in any auto-refreshing viewer (VS
-Code Remote's image preview, ``feh --auto-reload``, etc.) — no GUI display
-on this side, the script reads single chars from your terminal.
+The composite is shown live in an OpenCV window on the local display
+(``DISPLAY`` must be set, e.g. ``DISPLAY=:1``) and simultaneously recorded to
+a timestamped mp4 under ``outputs/real_camera_align/`` (git-ignored; override
+with ``--out_dir``).
 
 The overlay refreshes automatically at ~30 Hz — no manual recapture needed.
 
-Keys (typed in the terminal where the script is running, no Enter required):
+Keys (in the OpenCV window, or typed in the terminal, no Enter required):
 
   n         pick a new random frame, ramp the robot, wait, resume auto-capture
   q / ESC   exit (ramps back to ``SAFE_REST_DEGREES`` before disconnect)
+
+Closing the window also exits cleanly.
 
 The robot stack is ``BimanualClient`` → ``BiSOFollower`` → lerobot — no
 server-side code is involved. Run *in the lehome-challenge venv* (needs
@@ -120,14 +122,20 @@ SAFE_REST_DEGREES = np.array([
 ], dtype=np.float32)
 
 
-def _hardware_reset_realsense(yaml_cfg: dict) -> None:
-    """Issue ``hardware_reset()`` on the configured RealSense and sleep ~3s.
+def _hardware_reset_realsense(yaml_cfg: dict, wait_s: float = 15.0) -> None:
+    """Issue ``hardware_reset()`` on the configured RealSense, then wait for it
+    to re-enumerate (up to ``wait_s``).
 
     Does NOT open a pipeline (that caused lerobot's subsequent open to read
     no frames). Just resets the device so lerobot's fresh ``connect()``
     starts from a known-good state — and crucially, runs BEFORE any arm
     serial bus opens, so the right arm doesn't sit idle while the reset
     happens.
+
+    Opt-in only (``--camera_reset``): see :meth:`BimanualClient.__enter__` for
+    why the reset is dangerous on this rig. Polls for the device to come back
+    rather than sleeping blindly, so a camera that failed to re-enumerate is
+    reported here instead of surfacing later as an opaque connect failure.
     """
     cams = yaml_cfg.get("cameras", {})
     top = cams.get("top")
@@ -143,10 +151,29 @@ def _hardware_reset_realsense(yaml_cfg: dict) -> None:
         for dev in ctx.devices:
             if serial and dev.get_info(rs.camera_info.serial_number) != serial:
                 continue
-            log.info("hardware_reset() RealSense %s (3s settle) ...",
-                     dev.get_info(rs.camera_info.serial_number))
+            found = dev.get_info(rs.camera_info.serial_number)
+            log.info("hardware_reset() RealSense %s (waiting up to %.0fs for "
+                     "re-enumeration) ...", found, wait_s)
             dev.hardware_reset()
-            time.sleep(3.0)
+            deadline = time.time() + wait_s
+            while time.time() < deadline:
+                time.sleep(0.5)
+                try:
+                    back = [d.get_info(rs.camera_info.serial_number)
+                            for d in rs.context().devices]
+                except Exception:
+                    continue
+                if found in back:
+                    # Descriptors are up but the firmware needs a moment more
+                    # before it will accept a stream config.
+                    time.sleep(1.0)
+                    log.info("RealSense %s back after reset.", found)
+                    return
+            log.warning(
+                "RealSense %s did not re-enumerate within %.0fs after "
+                "hardware_reset() — replug it physically; the USB controller "
+                "may now be wedged.", found, wait_s,
+            )
             return
         log.warning("RealSense %s not found; skipping pre-reset.", serial or "(any)")
     except Exception as e:
@@ -162,11 +189,13 @@ class BimanualClient:
     """
 
     def __init__(self, yaml_path: Path, robot_id: str = "bimanual_follower",
-                 skip_cameras: bool = False, use_degrees: bool = True):
+                 skip_cameras: bool = False, use_degrees: bool = True,
+                 camera_reset: bool = False):
         with yaml_path.open() as fh:
             yaml_cfg = yaml.safe_load(fh)
         self._yaml_cfg = yaml_cfg
         self._skip_cameras = skip_cameras
+        self._camera_reset = camera_reset
         self._cfg = build_bi_so_follower_config(
             yaml_cfg, robot_id,
             skip_cameras=skip_cameras, use_degrees=use_degrees,
@@ -174,12 +203,17 @@ class BimanualClient:
         self.robot = BiSOFollower(self._cfg)
 
     def __enter__(self) -> "BimanualClient":
-        # Always hardware_reset() the RealSense BEFORE any arm bus opens.
-        # The reset alone takes ~3s; opening it inline (during right-arm
-        # connect) leaves the right arm's serial bus idle long enough that
-        # Feetech motors stop responding to writes. Reset first → motors only
-        # see a fast camera open path → enable_torque write succeeds.
-        if not self._skip_cameras:
+        # The RealSense hardware_reset() is opt-in (--camera_reset), because on
+        # this rig the D435 frequently fails to re-acquire a USB address
+        # afterwards ("device not accepting address, error -71") and jams the
+        # xHCI controller: the calling thread parks in xhci_setup_device
+        # forever, unkillable, and every later USB enumeration blocks behind
+        # it. Only a reboot clears that. A physical replug is the safe way to
+        # recover a sick camera. When the reset IS requested it still runs
+        # before any arm bus opens — it takes ~3s, and opening it inline during
+        # the right arm's connect leaves that serial bus idle long enough that
+        # the Feetech motors stop acking writes.
+        if self._camera_reset and not self._skip_cameras:
             _hardware_reset_realsense(self._yaml_cfg)
         self.robot.connect(calibrate=True)
         return self
@@ -188,8 +222,20 @@ class BimanualClient:
         self.robot.disconnect()
 
     def state(self) -> np.ndarray:
-        """Read current 12-vec joint state in degree-mode units."""
-        return state_dict_to_vec12(self.robot.get_observation())
+        """Read current 12-vec joint state in degree-mode units.
+
+        Reads the two motor buses directly instead of going through
+        ``get_observation()``: that also grabs a frame from every camera, so a
+        stalled camera raises here and aborts whatever motion is in flight. In
+        particular it would break the ramp back to ``SAFE_REST_DEGREES`` on
+        exit, leaving the arms parked at a dataset pose that goes limp as soon
+        as ``disconnect()`` drops torque.
+        """
+        obs: dict[str, float] = {}
+        for prefix, arm in (("left", self.robot.left_arm), ("right", self.robot.right_arm)):
+            for motor, pos in arm.bus.sync_read("Present_Position").items():
+                obs[f"{prefix}_{motor}.pos"] = pos
+        return state_dict_to_vec12(obs)
 
     def action(self, vec12: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Send one 12-vec degree-mode target. Returns ``(state_after, sent_after_clip)``."""
@@ -419,36 +465,52 @@ def capture_images_from_robot(client: BimanualClient) -> dict[str, np.ndarray]:
 # Compositing
 # ---------------------------------------------------------------------------
 
+def _blend(o: np.ndarray | None, c: np.ndarray | None, alpha: float) -> np.ndarray | None:
+    """Per-pixel alpha-blend of dataset frame (``alpha``) and live capture."""
+    if o is None or c is None:
+        return None
+    if c.shape[:2] != o.shape[:2]:
+        c = cv2.resize(c, (o.shape[1], o.shape[0]), interpolation=cv2.INTER_AREA)
+    return cv2.addWeighted(o, alpha, c, 1.0 - alpha, 0.0)
+
+
 def compose_overlay(
     orig: dict[str, np.ndarray],
     captured: dict[str, np.ndarray],
     *,
     alpha: float,
-    panel_h: int = 480,
+    inset_frac: float = 1 / 6,
 ) -> np.ndarray:
-    """3-panel RGB composite suitable for matplotlib ``imshow``.
+    """RGB composite: full-size top view with the two wrist views overlaid
+    as smaller picture-in-picture insets in its top corners.
 
-    Each panel is the per-pixel alpha-blend of the original dataset frame
-    (weight ``alpha``) and the live-robot capture (weight ``1 - alpha``),
-    resized to a common display height while preserving aspect ratio so we
-    can ``hstack`` them.
+    Every view is the per-pixel alpha-blend of the original dataset frame
+    (weight ``alpha``) and the live-robot capture (weight ``1 - alpha``).
     """
-    panels: list[np.ndarray] = []
-    for key in CAMERA_KEYS:
-        o = orig.get(key)
-        c = captured.get(key)
-        if o is None or c is None:
-            panels.append(np.zeros((panel_h, int(panel_h * 4 / 3), 3), dtype=np.uint8))
-            continue
-        if c.shape[:2] != o.shape[:2]:
-            c = cv2.resize(c, (o.shape[1], o.shape[0]), interpolation=cv2.INTER_AREA)
-        blended = cv2.addWeighted(o, alpha, c, 1.0 - alpha, 0.0)
-        h, w = blended.shape[:2]
-        if h != panel_h:
-            new_w = int(round(w * panel_h / h))
-            blended = cv2.resize(blended, (new_w, panel_h), interpolation=cv2.INTER_AREA)
-        panels.append(blended)
-    return np.concatenate(panels, axis=1)
+    main = _blend(orig.get("right_front"), captured.get("right_front"), alpha)
+    if main is None:
+        main = np.zeros((720, 1280, 3), dtype=np.uint8)
+    else:
+        main = main.copy()
+    mh, mw = main.shape[:2]
+
+    margin = 10
+    for key, label, corner in (("left_wrist", "L wrist", "left"),
+                               ("right_wrist", "R wrist", "right")):
+        inset = _blend(orig.get(key), captured.get(key), alpha)
+        iw = int(mw * inset_frac)
+        if inset is None:
+            ih = int(iw * 3 / 4)
+            inset = np.zeros((ih, iw, 3), dtype=np.uint8)
+        else:
+            ih = int(round(inset.shape[0] * iw / inset.shape[1]))
+            inset = cv2.resize(inset, (iw, ih), interpolation=cv2.INTER_AREA)
+        cv2.rectangle(inset, (0, 0), (iw - 1, ih - 1), (255, 255, 255), 1)
+        cv2.putText(inset, label, (5, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        x0 = margin if corner == "left" else mw - margin - iw
+        main[margin:margin + ih, x0:x0 + iw] = inset
+    return main
 
 
 # ---------------------------------------------------------------------------
@@ -486,8 +548,14 @@ def main() -> int:
                          "truth, even if lerobot's mismatch check passed).")
     ap.add_argument(
         "--out_dir", type=Path, default=DEFAULT_OUT_DIR,
-        help=f"Where to write the live overlay PNG (default: {DEFAULT_OUT_DIR}).",
+        help=f"Where to write the session video (default: {DEFAULT_OUT_DIR}).",
     )
+    ap.add_argument("--camera_reset", action="store_true",
+                    help="hardware_reset() the RealSense before connecting. OFF by "
+                         "default: on this rig the D435 often fails to re-acquire a "
+                         "USB address afterwards, which wedges the xHCI controller "
+                         "until the machine is rebooted. Prefer replugging the camera "
+                         "physically if it is misbehaving.")
     ap.add_argument("--dry_run", action="store_true",
                     help="Compute everything but do not touch the robot — useful for "
                          "smoke-testing the image decoding off-bench.")
@@ -513,12 +581,14 @@ def main() -> int:
         log.info("Dry-run frame: ep=%d fr=%d state_max=%.2f", ep, fr, float(np.abs(state).max()))
         return 0
 
-    out_path = (args.out_dir / "overlay.png").resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = (args.out_dir
+                  / f"align_{time.strftime('%Y%m%d_%H%M%S')}.mp4").resolve()
 
     # use_degrees=True: four_types_merged is recorded in degrees, so the
     # follower must speak the same units when we ramp_to() those states.
-    with BimanualClient(args.config, args.robot_id, use_degrees=True) as client:
+    with BimanualClient(args.config, args.robot_id, use_degrees=True,
+                        camera_reset=args.camera_reset) as client:
         _report_calibration(client, force_write=args.force_calibration)
         log.info("Robot connected. Picking initial frame ...")
         state, original_images, ep, fr = pick_random_frame(
@@ -530,25 +600,51 @@ def main() -> int:
         time.sleep(args.settle_time)
         captured = capture_images_from_robot(client)
 
-        def _write_overlay() -> None:
+        win = "real_camera_align"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        video_writer: cv2.VideoWriter | None = None
+
+        def _show_overlay() -> None:
+            nonlocal video_writer
             composite_rgb = compose_overlay(
                 original_images, captured, alpha=args.alpha,
             )
-            cv2.imwrite(
-                str(out_path), cv2.cvtColor(composite_rgb, cv2.COLOR_RGB2BGR),
+            bgr = cv2.cvtColor(composite_rgb, cv2.COLOR_RGB2BGR)
+            cv2.putText(
+                bgr, f"ep={ep} fr={fr}  alpha={args.alpha:.2f}",
+                (10, bgr.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 255, 0), 2,
             )
+            if video_writer is None:
+                h, w = bgr.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    str(video_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                    args.refresh_hz, (w, h),
+                )
+                if not video_writer.isOpened():
+                    raise RuntimeError(f"Could not open video writer: {video_path}")
+            video_writer.write(bgr)
+            cv2.imshow(win, bgr)
 
-        _write_overlay()
+        _show_overlay()
         log.info(
-            "Initial overlay written. ep=%d fr=%d. Auto-refresh @ %.0fHz.",
-            ep, fr, args.refresh_hz,
+            "Live overlay window open. ep=%d fr=%d. Auto-refresh @ %.0fHz. "
+            "Recording to %s", ep, fr, args.refresh_hz, video_path,
         )
         print(
-            f"\n>>> Open this file in any auto-refreshing viewer (VS Code "
-            f"Remote, feh --auto-reload, etc.):\n        {out_path}\n"
-            f">>> Keys: n=next random frame   q/ESC=quit (no Enter needed)\n",
+            f"\n>>> Live overlay in window '{win}'; session video: {video_path}\n"
+            f">>> Keys (window or terminal): n=next random frame   "
+            f"q/ESC=quit (no Enter needed)\n",
             flush=True,
         )
+
+        # SIGINT sets a flag instead of raising KeyboardInterrupt: an async
+        # interrupt mid serial-read leaves the Feetech port in a broken state
+        # ("Port is in use"), which then breaks the ramp-to-rest in cleanup.
+        import signal
+        stop_requested = {"stop": False}
+        signal.signal(signal.SIGINT,
+                      lambda *_: stop_requested.__setitem__("stop", True))
 
         period = 1.0 / max(1e-3, args.refresh_hz)
         fd, old_termios = _setup_cbreak()
@@ -556,10 +652,18 @@ def main() -> int:
         last_log = time.perf_counter()
         try:
             while True:
+                if stop_requested["stop"]:
+                    log.info("SIGINT received — shutting down cleanly.")
+                    break
                 t0 = time.perf_counter()
                 # Auto-recapture each iteration; the loop rate-limits below.
-                captured = capture_images_from_robot(client)
-                _write_overlay()
+                # A transient camera stall (e.g. RealSense frame >500ms old)
+                # must not kill the session — reuse the last frames instead.
+                try:
+                    captured = capture_images_from_robot(client)
+                except (TimeoutError, RuntimeError, KeyError) as e:
+                    log.warning("capture failed (%s) — reusing last frames", e)
+                _show_overlay()
                 frame_counter += 1
                 # Heartbeat every ~3s so the operator sees the loop is alive
                 # without spamming 30 lines/s.
@@ -567,12 +671,18 @@ def main() -> int:
                     fps = frame_counter / (t0 - last_log)
                     log.info(
                         "live: ep=%d fr=%d  refresh ~%.1fHz  → %s",
-                        ep, fr, fps, out_path.name,
+                        ep, fr, fps, video_path.name,
                     )
                     frame_counter = 0
                     last_log = t0
 
-                key = _poll_key()
+                # Keys from the OpenCV window (waitKey also pumps the GUI
+                # event loop) and from the terminal, treated identically.
+                wkey = cv2.waitKey(1) & 0xFF
+                key = _poll_key() or (chr(wkey).lower() if wkey != 0xFF else "")
+                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                    log.info("Overlay window closed.")
+                    break
                 if key in ("q", "\x1b", "\x03"):  # q, ESC, Ctrl-C
                     log.info("Quit key pressed.")
                     break
@@ -599,6 +709,10 @@ def main() -> int:
                     time.sleep(period - elapsed)
         finally:
             _restore_terminal(fd, old_termios)
+            if video_writer is not None:
+                video_writer.release()
+                log.info("Session video saved: %s", video_path)
+            cv2.destroyAllWindows()
             log.info("Ramping back to SAFE_REST over 4.0s ...")
             try:
                 client.ramp_to(SAFE_REST_DEGREES.astype(np.float32), 4.0)
