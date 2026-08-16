@@ -6,6 +6,10 @@
 
 📄 **Tech report:** [arXiv:2606.27163](https://arxiv.org/abs/2606.27163) · ✍️ **Blog post:** [ilialarchenko.com/projects/lehome2026](https://ilialarchenko.com/projects/lehome2026) · 🤗 **Checkpoints & data:** [`lehome_sim`](https://huggingface.co/IliaLarchenko/lehome_sim) (first-round policy) · [`lehome_real`](https://huggingface.co/IliaLarchenko/lehome_real) (second-round policy)
 
+🎬 **Video walkthrough:** a detailed [YouTube playlist](https://www.youtube.com/playlist?list=PLLwBN_w7MtPk) covering the whole solution — click the thumbnail to watch:
+
+[![Video walkthrough playlist](https://img.youtube.com/vi/mTohakalKz8/hqdefault.jpg)](https://www.youtube.com/playlist?list=PLLwBN_w7MtPk)
+
 ---
 
 ## What this is
