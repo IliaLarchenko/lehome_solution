@@ -999,11 +999,12 @@ def main():
                     restore_data["_semi_success_replay"] = True
             tasks.append((gt, gname, seed, restore_data))
         args.same_seed = True  # force same_seed for exact replay
-        # Force 100% garment augmentation for replay tasks
+        # Default to 100% garment augmentation for replay tasks; keys given
+        # explicitly via --aug_config win over the forced defaults.
         has_replay = any(ov.get("success_replay") or ov.get("semi_success_replay") for ov in overrides)
         if has_replay:
-            args._aug_config_dict["pattern_swap_p"] = 1.0
-            args._aug_config_dict["color_remap_p"] = 1.0
+            args._aug_config_dict.setdefault("pattern_swap_p", 1.0)
+            args._aug_config_dict.setdefault("color_remap_p", 1.0)
             args._aug_config_dict["enabled"] = True
             args.garment_augmentation = True
         replay_label = ""
